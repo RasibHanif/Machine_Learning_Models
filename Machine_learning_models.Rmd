@@ -1,0 +1,1193 @@
+INDEX
+
+1. Reading data
+2. Data Cleaning, Visualisation & preparation
+3. SVM model
+4. Logistic Regression
+5. Random Forest
+6. XGBoost
+7. ROC curves
+8. Gain Charts
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r message=FALSE }
+library(tidyverse)
+library(FSelector)
+library(randomForest)
+library(Hmisc)
+library(caret)
+library(e1071)
+library(pROC)
+library(ROSE)
+library(xgboost)
+library(smotefamily)
+```
+
+1. Reading the csv files to data frame
+-Importing both small file and large file.
+-Small file will be used for testing the challenger models and full datafile will be used for developing champion model
+```{r message=FALSE}
+
+datafile<-read.csv("datafile_full.csv")
+datafile_small<-read.csv("datafile_small.csv")
+```
+
+
+2. Data Cleaning, Visualisation and Preparation
+
+```{r eval=False}
+str(datafile)
+```
+
+
+```{r}
+
+x<-datafile%>%group_by(ID_code)
+length(unique(x$ID_code))
+
+datafile<-datafile%>%select(-ID_code)%>%mutate(target=as.factor(target))
+datafile_small<-datafile_small%>%select(-ID_code)%>%mutate(target=as.factor(target))
+
+ggplot(data=datafile,aes(x=target, fill=target))+geom_bar(color="black", fill="darkred", alpha=0.8)+ggtitle("Distribution")+labs(y = "Frequency")
+```
+
+
+
+```{r }
+Infogain<-information.gain(target~.,datafile)%>%arrange(desc(attr_importance))%>%subset(attr_importance>0)
+datafile<-na.omit(datafile)
+datafile_small<-na.omit(datafile_small)
+
+```
+
+
+Checking Density plot Distribution of High information gain variables
+
+```{r message=FALSE}
+
+gridExtra::grid.arrange(
+ggplot(data=datafile, aes(x=var_9, col=target))+geom_density(),
+ggplot(data=datafile, aes(x=var_13, col=target))+geom_density(),
+ggplot(data=datafile, aes(x=var_108, col=target))+geom_density(),
+ggplot(data=datafile, aes(x=var_148, col=target))+geom_density(),
+ggplot(data=datafile, aes(x=var_158, col=target))+geom_density(),
+ggplot(data=datafile, aes(x=var_168, col=target))+geom_density(),
+ggplot(data=datafile, aes(x=var_81, col=target))+geom_density(),
+ncol =3
+)
+
+```
+
+Replacing Outliers 
+```{r message=FALSE}
+#Replace outliers in each column with the nearest boundary
+len_dfs <- dim(datafile)
+for(i in 2:len_dfs[2]){
+  dstats <- list(boxplot.stats(datafile[,i])$stats[1], boxplot.stats(datafile[,i])$stats[5]) 
+  outliers_min <- which(datafile[,i] < dstats[1])
+  outliers_max <- which(datafile[,i] > dstats[2])
+  ds <- replace(datafile[,i], outliers_min, dstats[1])
+  ds <- replace(datafile[,i], outliers_max, dstats[2])
+  datafile[,i] <- as.numeric(ds)
+}
+
+
+len_dfs <- dim(datafile_small)
+for(i in 2:len_dfs[2]){
+  dstats <- list(boxplot.stats(datafile_small[,i])$stats[1], boxplot.stats(datafile_small[,i])$stats[5]) 
+  outliers_min <- which(datafile_small[,i] < dstats[1])
+  outliers_max <- which(datafile_small[,i] > dstats[2])
+  ds <- replace(datafile_small[,i], outliers_min, dstats[1])
+  ds <- replace(datafile_small[,i], outliers_max, dstats[2])
+  datafile_small[,i] <- as.numeric(ds)
+}
+```
+
+Normalization
+```{r message=FALSE}
+#install.packages("BBmisc")
+library(BBmisc)
+datafile <- normalize(datafile, method = "range", range = c(0,1))
+
+datafile_small <- normalize(datafile_small, method = "range", range = c(0,1))
+```
+
+
+
+Building Undersampled, OverSampled and Both sampled datasets for training Models
+
+```{r message=FALSE}
+set.seed(111)
+split<-caTools::sample.split(datafile$target,0.7)
+test<-datafile[which(split==0),]
+training<-datafile[which(split==1),]
+
+training_o<-ROSE::ovun.sample(target~.,training,method="over",p=0.5,seed=10)$data
+training_b<-ROSE::ovun.sample(target~.,training,method="both",p=0.5,seed=10)$data
+training_u<-ROSE::ovun.sample(target~.,training,method="under",p=0.5,seed=10)$data
+```
+
+```{r message=FALSE}
+set.seed(111)
+split<-caTools::sample.split(datafile_small$target,0.7)
+test_small<-datafile_small[which(split==0),]
+training_small<-datafile_small[which(split==1),]
+
+training_o_small<-ROSE::ovun.sample(target~.,training_small,method="over",p=0.5,seed=10)$data
+training_b_small<-ROSE::ovun.sample(target~.,training_small,method="both",p=0.5,seed=10)$data
+training_u_small<-ROSE::ovun.sample(target~.,training_small,method="under",p=0.5,seed=10)$data
+```
+
+
+x-------------------------------------------------SVM-------------------------------------------------------x
+
+
+```{r}
+#extract top 30 information gain variables 
+attribute_weights <- information.gain(target ~., datafile_small)
+filtered_attributes <- cutoff.k(attribute_weights, 30)
+print(filtered_attributes)
+```
+
+```{r}
+data_small_30attribute <- datafile_small[filtered_attributes]
+head(data_small_30attribute)
+data_small_30attribute$target <- datafile_small$target
+
+data_full_30attribute <- datafile[filtered_attributes]
+head(data_full_30attribute)
+data_full_30attribute$target <- datafile$target
+```
+
+```{r}
+#check correlation
+datafile_small_cor <- cor(data_small_30attribute[,-31])
+datafile_full_cor <- cor(data_full_30attribute[,-31])
+```
+
+```{r}
+#if two variable correlation is larger than 0.3, we will delete one
+
+#install.packages("rapportools")
+library(rapportools)
+correlated_group <- findCorrelation(datafile_small_cor, cutoff = 0.3)
+if (is.empty(c(correlated_group)) == FALSE){
+  reduced_datafile_small <- data_small_30attribute[,-c(hc)]
+}else{
+  reduced_datafile_small <- data_small_30attribute
+}
+
+correlated_group_full <- findCorrelation(datafile_full_cor, cutoff = 0.3)
+if (is.empty(c(correlated_group_full)) == FALSE){
+  reduced_datafile_full <- data_full_30attribute[,-c(hc)]
+}else{
+  reduced_datafile_full <- data_full_30attribute
+  }
+```
+
+
+data sampling for SVM
+
+```{r}
+library(caTools)
+set.seed(123)
+
+#generate split vector to partition the data into training and test sets with training ratio of 0.7
+split = sample.split(reduced_datafile_small$target, SplitRatio = 0.7)
+
+
+#generate the training and test sets by subsetting the data records form original dataset
+training_set = subset(reduced_datafile_small, split == TRUE)
+test_set = subset(reduced_datafile_small, split == FALSE)
+```
+
+
+```{r}
+#data sampling without feature selection
+set.seed(123)
+#generate split vector to partition the data into training and test sets with training ratio of 0.7
+split_or = sample.split(datafile_small$target, SplitRatio = 0.7)
+
+
+#generate the training and test sets by subsetting the data records form original dataset
+training_set_or = subset(datafile_small, split == TRUE)
+test_set_or = subset(datafile_small, split == FALSE)
+```
+
+
+Checking the distribution of target Variable
+```{r}
+table(training_set$target)
+
+#Find the proportion of transaction is 1
+prop.table(table(training_set$target))
+```
+
+
+Building seveleral svm models for identifying best parameters for getting the value for F1 and Area under curve(AUC)
+
+SVM1
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = radial
+Sampling= Base Data
+
+```{r}
+#build svm model which kernel = radial
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  radial_SVM_model <- svm(target ~. , data = training_set, kernel= "radial", scale = TRUE, probability = TRUE, cost = cost[i])
+  
+ #predicting the test set results
+ svm_predict_radial <- predict(radial_SVM_model, test_set, probability = TRUE)
+ 
+ #use confusionMatrix to print the performance of SVM model
+ svm_radial_CM <-confusionMatrix(svm_predict_radial, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_radial_CM)
+ 
+ SVM_prob_radial <- attr(svm_predict_radial, "probabilities")[,2]
+ 
+ #ROC
+ ROC_SVM_radial<- roc(test_set$target, SVM_prob_radial)
+ 
+ df_SVM_radial = data.frame((1-ROC_SVM_radial$specificities), ROC_SVM_radial$sensitivities)
+ 
+ #AUC
+ print(auc(ROC_SVM_radial))
+ 
+ 
+}
+```
+
+
+SVM2
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = linear
+Sampling= Base Data
+
+```{r}
+
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  linear_SVM_model <- svm(target ~. , data = training_set, kernel= "linear", scale = TRUE, probability = TRUE, cost = cost[i])
+  
+ svm_predict_linear <- predict(linear_SVM_model, test_set, probability = TRUE)
+ 
+ svm_linear_CM <-confusionMatrix(svm_predict_linear, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_linear_CM)
+ 
+ SVM_prob_linear <- attr(svm_predict_linear, "probabilities")[,2]
+ 
+ ROC_SVM_linear <- roc(test_set$target, SVM_prob_linear)
+ 
+ df_SVM_linear = data.frame((1-ROC_SVM_linear$specificities), ROC_SVM_linear$sensitivities)
+ 
+ print(auc(ROC_SVM_linear))
+ 
+ 
+}
+
+```
+
+
+Undersampling the data to check on SVM models
+
+```{r}
+#the data is imbalance, so we need to deal with them
+#install.packages("ROSE")
+library(ROSE)
+```
+
+```{r}
+undersampled_SVM <- ovun.sample(target ~., data = training_set, method = "under", p = 0.5, seed = 1)$data
+#check the distribution of feature target
+table(undersampled_SVM$target)
+#check the proportion of classes
+prop.table((table(undersampled_SVM$target)))
+```
+
+
+SVM3
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = radial
+Sampling= Undersampled data
+
+```{r}
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  radial_undersampled_SVM_model <- svm(target ~. , data = undersampled_SVM, kernel= "radial", scale = TRUE, probability = TRUE, cost = cost[i])
+  
+ svm_predict_radial_undersampled <- predict(radial_undersampled_SVM_model, test_set, probability = TRUE)
+ 
+
+ svm_radial_undersampled_CM <-confusionMatrix(svm_predict_radial_undersampled, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_radial_undersampled_CM)
+ 
+ SVM_prob_radial_undersampled <- attr(svm_predict_radial_undersampled, "probabilities")[,2]
+ 
+ ROC_SVM_radial_undersampled <- roc(test_set$target, SVM_prob_radial_undersampled)
+ 
+ df_SVM_radial_undersampled = data.frame((1-ROC_SVM_radial_undersampled$specificities), ROC_SVM_radial_undersampled$sensitivities)
+ 
+ print(auc(ROC_SVM_radial_undersampled))
+ 
+ 
+}
+
+```
+
+
+SVM4
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = linear
+Sampling= Undersampled data
+```{r}
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  linear_undersampled_SVM_model <- svm(target ~. , data = undersampled_SVM, kernel= "linear", scale = TRUE, probability = TRUE, cost = cost[i])
+  
+ svm_predict_linear_undersampled <- predict(linear_undersampled_SVM_model, test_set, probability = TRUE)
+ 
+ svm_linear_undersampled_CM <-confusionMatrix(svm_predict_linear_undersampled, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_linear_undersampled_CM)
+ 
+ SVM_prob_linear_undersampled <- attr(svm_predict_linear_undersampled, "probabilities")[,2]
+ 
+ ROC_SVM_linear_undersampled <- roc(test_set$target, SVM_prob_linear_undersampled)
+ 
+ df_SVM_linear_undersampled = data.frame((1-ROC_SVM_linear_undersampled$specificities), ROC_SVM_linear_undersampled$sensitivities)
+ 
+ print(auc(ROC_SVM_linear_undersampled))
+ 
+}
+
+```
+
+
+Oversampling the data to check on SVM models
+
+```{r}
+
+oversampled_SVM <- ovun.sample(target ~., data = training_set, method = "over", p = 0.5, seed = 1)$data
+
+table(oversampled_SVM$target)
+
+prop.table((table(oversampled_SVM$target)))
+```
+
+
+
+SVM5
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = radial
+Sampling= Oversampled data
+
+```{r}
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  radial_oversampled_SVM_model <- svm(target ~. , data = oversampled_SVM, kernel= "radial", scale = TRUE, probability = TRUE, cost = cost[i])
+  
+ svm_predict_radial_oversampled <- predict(radial_oversampled_SVM_model, test_set, probability = TRUE)
+ 
+ svm_radial_oversampled_CM <-confusionMatrix(svm_predict_radial_oversampled, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_radial_oversampled_CM)
+ 
+ SVM_prob_radial_oversampled <- attr(svm_predict_radial_oversampled, "probabilities")[,2]
+ 
+ ROC_SVM_radial_oversampled <- roc(test_set$target, SVM_prob_radial_oversampled)
+ 
+ df_SVM_radial_oversampled = data.frame((1-ROC_SVM_radial_oversampled$specificities), ROC_SVM_radial_oversampled$sensitivities)
+ 
+ print(auc(ROC_SVM_radial_oversampled))
+ 
+ 
+}
+
+```
+
+SVM6
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = linear
+Sampling= Oversampled data
+
+```{r}
+
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  linear_oversampled_SVM_model <- svm(target ~. , data = oversampled_SVM, kernel= "linear", scale = TRUE, probability = TRUE, cost = cost[i])
+  
+ svm_predict_linear_oversampled <- predict(linear_oversampled_SVM_model, test_set, probability = TRUE)
+ 
+ svm_linear_oversampled_CM <-confusionMatrix(svm_predict_linear_oversampled, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_linear_oversampled_CM)
+ 
+ SVM_prob_linear_oversampled <- attr(svm_predict_linear_oversampled, "probabilities")[,2]
+ 
+ ROC_SVM_linear_oversampled <- roc(test_set$target, SVM_prob_linear_oversampled)
+ 
+ df_SVM_linear_oversampled = data.frame((1-ROC_SVM_linear_oversampled$specificities), ROC_SVM_linear_oversampled$sensitivities)
+ 
+ print(auc(ROC_SVM_linear_oversampled))
+ 
+}
+
+```
+
+Using SMOTE to Oversample the data and set different costs to different classes to check on SVM models
+
+```{r}
+#SVM oversampling
+SMOTE_SVM <- SMOTE(training_set[,-31], training_set$target,dup_size = 8)$data
+#check the distribution of feature target
+table(SMOTE_SVM$class)
+#check the proportion of classes
+prop.table((table(SMOTE_SVM$class)))
+```
+
+```{r}
+str(SMOTE_SVM)
+```
+
+```{r}
+SMOTE_SVM$class <- as.factor(SMOTE_SVM$class)
+```
+
+
+SVM7
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = linear
+Sampling= SMOTE data
+Class_weights = 1/9
+
+```{r}
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  linear_SMOTE_SVM_model <- svm(class ~. , data = SMOTE_SVM, kernel= "linear", scale = TRUE, probability = TRUE, cost = cost[i], class_weights = 1/9)
+
+ svm_predict_linear_SMOTE <- predict(linear_SMOTE_SVM_model, test_set, probability = TRUE)
+ 
+ svm_linear_SMOTE_CM <-confusionMatrix(svm_predict_linear_SMOTE, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_linear_SMOTE_CM)
+ 
+ SVM_prob_linear_SMOTE <- attr(svm_predict_linear_SMOTE, "probabilities")[,2]
+ 
+ ROC_SVM_linear_SMOTE <- roc(test_set$target, SVM_prob_linear_SMOTE)
+ 
+ df_SVM_linear_SMOTE = data.frame((1-ROC_SVM_linear_SMOTE$specificities), ROC_SVM_linear_SMOTE$sensitivities)
+ 
+ print(auc(ROC_SVM_linear_SMOTE))
+ 
+}
+
+
+```
+
+
+
+SVM8
+Parameters Checked : 
+
+Cost - 0.1, 1, 10
+kernel = radial
+Sampling= SMOTE data
+Class_weights = 1/9
+
+```{r}
+cost = c(0.1, 1, 10)
+
+for (i in 1:length(cost) ){
+  radial_SMOTE_SVM_model <- svm(class ~. , data = SMOTE_SVM, kernel= "radial", scale = TRUE, probability = TRUE, cost = cost[i], class_weights = 1/9)
+
+ svm_predict_radial_SMOTE <- predict(radial_SMOTE_SVM_model, test_set, probability = TRUE)
+ 
+ svm_radial_SMOTE_CM <-confusionMatrix(svm_predict_radial_SMOTE, test_set$target, positive = "1", mode = "prec_recall")
+ 
+ print(svm_radial_SMOTE_CM)
+ 
+ SVM_prob_radial_SMOTE <- attr(svm_predict_radial_SMOTE, "probabilities")[,2]
+ 
+ ROC_SVM_radial_SMOTE <- roc(test_set$target, SVM_prob_radial_SMOTE)
+ 
+ df_SVM_radial_SMOTE = data.frame((1-ROC_SVM_radial_SMOTE$specificities), ROC_SVM_radial_SMOTE$sensitivities)
+ 
+ print(auc(ROC_SVM_radial_SMOTE))
+}
+
+```
+
+
+Based on above manual Hyperparameter optimisation for SVM, we have achieved best AUC and F1 at below parameters
+
+
+SVM Final
+Parameters Checked : 
+
+Cost - 0.1
+kernel = radial
+Sampling= Oversampled data at 0.5 ratio
+
+
+```{r}
+#whole dataset oversampling with feature selection
+set.seed(123)
+split_fs = sample.split(reduced_datafile_full$target, SplitRatio = 0.7)
+training_o_fs = subset(reduced_datafile_full, split == TRUE)
+test_o_fs = subset(reduced_datafile_full, split == FALSE)
+oversampling_LR_whole <- ovun.sample(target ~., data = training_o_fs, method = "over", p = 0.5, seed = 1)$data
+```
+
+
+```{r}
+#use the whole dataset
+best_svm_model <- svm(target ~. , data = training_o_fs, kernel= "radial", scale = TRUE, probability = TRUE, cost = 0.1)
+best_svm_predict <- predict(best_svm_model,test_o_fs, probability = TRUE)
+best_svm_CM <-confusionMatrix(best_svm_predict, test_o_fs$target, positive = "1", mode = "prec_recall")
+print(best_svm_CM)
+best_svm_prob <- attr(best_svm_predict, "probabilities")[,2]
+
+
+ROC_best_svm <- roc(test_o_fs$target, best_svm_prob)
+
+print(auc(ROC_best_svm))
+```
+
+
+
+x-----------------------------------------------Logistic Regression-----------------------------------------x
+
+Building Logistic regression model
+
+
+Undersampling for Logistic Regression
+```{r}
+
+undersampled_LR <- ovun.sample(target ~., data = training_set, method = "under", p = 0.5, seed = 1)$data
+undersampled_LR_or <- ovun.sample(target ~., data = training_set_or, method = "under", p = 0.5, seed = 1)$data
+
+
+#check the distribution of feature target
+table(undersampled_LR$target)
+#check the proportion of classes
+prop.table((table(undersampled_LR$target)))
+```
+
+
+
+Logistic Regression 1 
+
+Parameters Checked : 
+
+Features = Top 30
+Sampling= Undersampled data at 0.5
+
+```{r}
+glm.fits.under=glm(target~., data=undersampled_LR ,family =binomial )
+
+summary(glm.fits.under)
+coef(glm.fits.under)
+summary(glm.fits.under)$coef
+
+glm.probs.under<-predict(glm.fits.under, test_set, type = 'response')
+target_test_under<-test_set$target
+
+
+LR_undersampled_target <- ifelse(glm.probs.under > 0.5, "1", "0")
+LR_undersampled_target <- as.factor(LR_undersampled_target)
+LR_undersampled_CM <- confusionMatrix(LR_undersampled_target, test_set$target, positive = '1', mode = "prec_recall")
+
+print(LR_undersampled_CM)
+
+
+ROC_undersampled_LR <- roc(test_set$target, glm.probs.under)
+
+auc(ROC_undersampled_LR)
+
+```
+
+
+Logistic Regression 2
+
+Parameters Checked : 
+
+Features = All
+Sampling= Undersampled data at 0.5
+
+```{r}
+glm.fits.under_or=glm(target~., data=undersampled_LR_or ,family =binomial )
+summary(glm.fits.under_or)
+coef(glm.fits.under_or)
+summary(glm.fits.under_or)$coef
+
+glm.probs.under_or<-predict(glm.fits.under_or, test_set_or, type = 'response')
+target_test_under_or<-test_set_or$target
+
+
+
+LR_undersampled_target_or <- ifelse(glm.probs.under_or > 0.5, "1", "0")
+LR_undersampled_target_or <- as.factor(LR_undersampled_target_or)
+LR_undersampled_CM_or <- confusionMatrix(LR_undersampled_target_or, test_set$target, positive = '1', mode = "prec_recall")
+
+print(LR_undersampled_CM_or)
+
+
+
+ROC_undersampled_LR_or <- roc(test_set_or$target, glm.probs.under_or)
+
+auc(ROC_undersampled_LR_or)
+
+
+```
+
+
+
+Oversampling for Logistic Regression
+
+```{r}
+oversampled_LR <- ovun.sample(target ~., data = training_set, method = "over", p = 0.5, seed = 1)$data
+oversampled_LR_or <- ovun.sample(target ~., data = training_set_or, method = "over", p = 0.5, seed = 1)$data
+#check the distribution of feature target
+table(oversampled_LR$target)
+#check the proportion of classes
+prop.table((table(oversampled_LR$target)))
+```
+
+
+
+Logistic Regression 3
+
+Parameters Checked : 
+
+Features = Top 30
+Sampling= Undersampled data at 0.5
+
+```{r}
+glm.fits.over=glm(target~., data=oversampled_LR ,family =binomial )
+summary(glm.fits.over)
+
+coef(glm.fits.over)
+summary(glm.fits.over)$coef
+
+
+glm.probs.over<-predict(glm.fits.over, test_set, type = 'response')
+target_test_over<-test_set$target
+
+LR_oversampled_target <- ifelse(glm.probs.over > 0.5, "1", "0")
+LR_oversampled_target <- as.factor(LR_oversampled_target)
+LR_oversampled_CM <- confusionMatrix(LR_oversampled_target, test_set$target, positive = '1', mode = "prec_recall")
+
+print(LR_oversampled_CM)
+
+ROC_oversampled_LR <- roc(test_set$target, glm.probs.over)
+
+auc(ROC_oversampled_LR)
+
+
+```
+
+
+
+Logistic Regression 4
+
+Parameters Checked : 
+
+Features = All
+Sampling= Oversampled data at 0.5
+```{r}
+
+glm.fits.over_or=glm(target~., data=oversampled_LR_or ,family =binomial )
+summary(glm.fits.over_or)
+
+coef(glm.fits.over_or)
+summary(glm.fits.over_or)$coef
+
+
+glm.probs.over_or<-predict(glm.fits.over_or, test_set_or, type = 'response')
+target_test_over_or<-test_set_or$target
+
+
+LR_oversampled_target_or <- ifelse(glm.probs.over_or > 0.5, "1", "0")
+LR_oversampled_target_or <- as.factor(LR_oversampled_target_or)
+LR_oversampled_CM_or <- confusionMatrix(LR_oversampled_target_or, test_set_or$target, positive = '1', mode = "prec_recall")
+
+print(LR_oversampled_CM_or)
+
+ROC_oversampled_LR_or <- roc(test_set_or$target, glm.probs.over_or)
+
+auc(ROC_oversampled_LR_or)
+```
+
+
+Based on above manual Hyperparameter optimisation for Logistic Regression, we have achieved best AUC and F1 at below parameters
+
+
+Logistic Regression Final
+
+Parameters Checked : 
+
+Features = All
+Sampling= Oversampled data at 0.5 ratio
+
+```{r}
+best_LR_model = glm(target~., data=training_o ,family =binomial )
+summary(best_LR_model)
+coef(best_LR_model)
+summary(best_LR_model)$coef
+best_LR_model_probs<-predict(best_LR_model, test, type = 'response')
+best_LR_target_test<-test$target
+
+best_LR_target <- ifelse(best_LR_model_probs > 0.5, "1", "0")
+best_LR_target <- as.factor(best_LR_target)
+best_LR_CM <- confusionMatrix(best_LR_target, test$target, positive = '1', mode = "prec_recall")
+
+print(best_LR_CM)
+ROC_best_LR <- roc(test$target, best_LR_model_probs)
+
+print(auc(ROC_best_LR))
+
+```
+
+
+
+
+xx--------------------------------------------------Random Forest-------------------------------------------xx
+
+Random Forest1
+Parameters checked
+ntree=500
+Data= Oversampled data at 0.5
+```{r message=FALSE}
+
+set.seed(11)
+
+RF_model_o<-randomForest::randomForest(target~.,training_o_small,ntree=500)
+RF_o<-predict(RF_model_o,test_small)
+caret::confusionMatrix(RF_o,test_small$target,mode="prec_recall", positive='1')
+```
+
+
+
+Random Forest2
+Parameters checked
+ntree=500
+Data= Bothampled data at 0.5
+```{r message=FALSE}
+
+set.seed(11)
+RF_model_b<-randomForest::randomForest(target~.,training_b_small,ntree=500)
+RF_b<-predict(RF_model_b,test_small)
+caret::confusionMatrix(RF_b,test_small$target,mode="prec_recall", positive='1')
+```
+
+
+
+Random Forest3
+Parameters checked
+ntree=6000
+Data= Undersampled data at 0.5
+
+```{r message=FALSE}
+
+set.seed(11)
+RF_model_u<-randomForest::randomForest(target~.,training_u,ntree=6000)
+RF_u<-predict(RF_model_u,test)
+caret::confusionMatrix(RF_u,final$target,mode="prec_recall", positive='1')
+
+
+RF1_prob<-predict(RF_model_u, test, type = "prob")[,2]
+
+final<-test
+
+final$RF1_prob<-RF1_prob
+
+ROC_RF1 <- pROC::roc(test$target, RF1_prob)
+pROC::auc(ROC_RF1)
+
+```
+
+
+Based on confusion matrix checked, best results for random forest achieved from undersampling the data
+- We use undersampling data only for futher analysis
+
+```{r message=FALSE}
+plot(RF_model_u)
+```
+
+Since the error rate saturates at 6000 trees. We set ntree = 6000 for final model
+
+```{r message=FALSE}
+
+tree_imp<-data.frame(importance(RF_model_u))
+
+tree_imp<-arrange(tree_imp,desc(MeanDecreaseGini))%>%rename(attr_importance=MeanDecreaseGini)
+
+varUsed(RF_model_u)
+
+varImpPlot(RF_model_u,sort=T)
+```
+
+
+Tuning the random forest model to find the best mtry value. 
+```{r message=FALSE}
+
+target_variables<-cutoff.k(tree_imp,200)
+set.seed(11)
+t<-tuneRF(training_u_small[,target_variables], training_u_small[,"target"],
+          stepFactor=2,
+          plot=T,
+          ntree=6000,
+          trace=T,
+          improve=0.0001
+          )
+
+
+```
+
+Least OOB error achieved at Mtry= 4. Will check Mtry at values 2,4,5 to find the maximum value for AUC
+
+Based on above analysis we use following parameters for building our final model
+
+Random Forest Final
+
+Parameters checked
+  Variables Used - All(var_0 - var_199)
+  ntree=6000
+  Mtry=2,4,5
+  Undersampling = 0.5
+
+```{r message=FALSE}
+
+set.seed(11)
+target_variables_iter<-c(cutoff.k(tree_imp,200),"target")
+
+training_top_iter<-training_u[target_variables_iter]
+test_top_iter<-test[target_variables_iter]
+
+RF_model_u_ideal<-randomForest::randomForest(target~.,training_top_iter,ntree=6000,mtry=2)
+
+RF_u_ideal<-predict(RF_model_u_ideal,test_top_iter)
+
+
+RF2_prob<-predict(RF_model_u_ideal, test_top_iter, type = "prob")[,2]
+ROC_RF2 <- pROC::roc(test$target, RF2_prob)
+
+final$RF2_prob<-RF2_prob
+
+pROC::auc(ROC_RF2)
+
+```
+
+
+
+
+xx-------------------------------------------------XGBoost Model--------------------------------------------xx
+
+XGBoost is also a tree ensamble method with some advantages over Random forest
+ - Better performace rate in processing, since it works on parallel processing.
+ - Improves incrementally over previous iterations which allows manually to set objective for improvement(AUC in our case)
+
+
+
+
+XGBoost1 
+
+Parameters Checked : 
+
+Features = All
+Sampling= Undersampled data at 0.5
+nrounds=2000
+eta - 0.1
+Booster - "GBlinear"
+
+
+```{r message=FALSE}
+library(xgboost)
+
+training_xg<- training_o
+
+nrounds = 3
+set.seed(111)
+folds = caret::createFolds(factor(training_xg$target), k = 5, list = FALSE)
+
+#for (i in 1:5){
+i=5
+train_xg_o<-select(training_xg,-"target")[which(folds!=i),]
+val_xg_o<-select(training_xg,-"target")[which(folds==i),]
+
+lab_tr<-select(training_xg,"target")[which(folds!=i),]
+lab_val<-select(training_xg,"target")[which(folds==i),]
+
+dmtrain_o <- xgb.DMatrix(as.matrix(train_xg_o), label = as.matrix(lab_tr))
+dmval_o   <- xgb.DMatrix(as.matrix(val_xg_o), label = as.matrix(lab_val))
+
+
+p<- list(objective = "binary:logistic",
+          eval_metric = "auc",
+         
+         eta = 0.1,
+          booster="gblinear"
+)
+XGB_Oversampled <- xgb.train(data = dmtrain_o,
+                           params = p,
+                           watchlist= list(validation1=dmval_o, validation2=dmtrain_o),
+                           early_stopping_rounds=50,
+                           nrounds = 2000,
+                           print_every_n = 100
+                           )
+
+
+
+#Predicting the values based on test data
+test_xg<-select(test,-"target")
+dtest <- xgb.DMatrix(as.matrix(test_xg), label = as.matrix(test$target))
+pred_xgb_o <- predict(XGB_Oversampled, dtest)
+
+
+#}
+
+final$pred_xgb_o<-pred_xgb_o
+
+
+ROC_XGB1 <- pROC::roc(test$target, pred_xgb_o)
+
+pROC::auc(ROC_XGB1)
+
+```
+
+
+Tuning the XGboost model with Hyper parameter Optimisation
+Evaluation Criteria: Area under Curve
+Parameters Test:
+  Under Sampling Rate - 0.1, 0.11, 0.2, 0.5, 0.55
+  Booster             - GBlinear, GBTree
+  Max_Depth           - 1,2,4,8
+  eta                 - 0.02, 0.03,0.04,1,6
+  nrounds             - 4000 with early_stopping_rounds=100
+```{r}
+
+big_grid <- expand.grid(booster=c("gblinear","gbtree"), max_depth = c(1,2,4,8), eta=c(0.02, 0.03,0.04,1))
+big_grid$auc<-0
+set.seed(111)
+
+training_xg<- ROSE::ovun.sample(target~.,training,method="under",p=0.11,seed=10)$data
+
+folds = caret::createFolds(factor(training_xg$target), k = 5, list = FALSE)
+
+#for (i in 1:5){
+i=5
+
+train_xg<-select(training_xg,-"target")[which(folds!=i),]
+val_xg<-select(training_xg,-"target")[which(folds==i),]
+
+lab_tr<-select(training_xg,"target")[which(folds!=i),]
+lab_val<-select(training_xg,"target")[which(folds==i),]
+
+dmtrain <- xgb.DMatrix(as.matrix(train_xg), label = as.matrix(lab_tr))
+dmval   <- xgb.DMatrix(as.matrix(val_xg), label = as.matrix(lab_val))
+
+test_xg<-select(test,-"target")
+dtest <- xgb.DMatrix(as.matrix(test_xg), label = as.matrix(test$target))
+
+cnt=0
+for (et in unique(big_grid$eta)){
+  for (depth in unique(big_grid$max_depth)){
+      for (boost in unique(big_grid$booster)){
+  p<- list(objective = "binary:logistic",
+          eval_metric = "auc",
+          eta = et,
+          max_depth=depth,
+          booster=boost
+)
+XGB0 <- xgb.train(data=dmtrain,
+                 params = p,
+                 watchlist= list(validation1=dmval),
+                 early_stopping_rounds=100,
+                 nrounds = 1000,
+                 print_every_n = 100
+                 )
+
+pred_xgb0 <- predict(XGB0, dtest)
+
+ROC_XGB0 <- pROC::roc(test$target, pred_xgb0)
+cnt=cnt+1
+big_grid$auc[cnt]<-pROC::auc(ROC_XGB0)
+}
+}}
+
+print(subset(big_grid,auc==max(big_grid$auc)))
+```
+
+
+Max AUC achieved at Undersampling = 0.11, Booster = "GBTree", Max_Depth = 2, eta = 0.04 --> AUC=0.8839
+
+
+XGBoost Final
+
+Using above parameters for final model
+
+```{r message=FALSE}
+
+#Building Final model based on above mentioned optimised parameters
+
+training_xg<- ROSE::ovun.sample(target~.,training,method="under",p=0.11,seed=10)$data
+
+nrounds = 3
+set.seed(111)
+
+i=5
+folds = caret::createFolds(factor(training_xg$target), k = 5, list = FALSE)
+
+train_xg<-select(training_xg,-"target")[which(folds!=i),]
+val_xg<-select(training_xg,-"target")[which(folds==i),]
+
+lab_tr<-select(training_xg,"target")[which(folds!=i),]
+lab_val<-select(training_xg,"target")[which(folds==i),]
+
+dmtrain <- xgb.DMatrix(as.matrix(train_xg), label = as.matrix(lab_tr))
+dmval   <- xgb.DMatrix(as.matrix(val_xg), label = as.matrix(lab_val))
+
+
+p<- list(objective = "binary:logistic",
+          eval_metric = "auc",
+          eta = 0.04,
+          max_depth=2,
+          booster="gbtree"
+)
+XGB <- xgb.train(data=dmtrain,
+                 params = p,
+                 watchlist= list(validation1=dmval),
+                 early_stopping_rounds=100,
+                 nrounds = 4000,
+                 print_every_n = 1
+                 )
+
+
+
+#Predicting the values based on test data
+test_xg<-select(test,-"target")
+dtest <- xgb.DMatrix(as.matrix(test_xg), label = as.matrix(test$target))
+
+pred_xgb <- predict(XGB, dtest)
+
+final$pred_xgb<-pred_xgb
+
+ROC_XGB2 <- pROC::roc(test$target, pred_xgb)
+
+pROC::auc(ROC_XGB2)
+
+```
+
+
+
+
+x-------------------------------------------------------AUC-------------------------------------------------x
+
+```{r}
+
+print(auc(ROC_best_svm))
+print(auc(ROC_best_LR))
+print(auc(ROC_RF2))
+print(auc(ROC_XGB2))
+
+```
+
+x---------------------------------------------------ROC Curves----------------------------------------------x
+
+Using ROC curves and gain charts to compare models for efficiency
+
+```{r message=FALSE}
+set.seed(11)
+#ROC curves 
+
+df_RF2 = data.frame((1-ROC_RF2$specificities), ROC_RF2$sensitivities)
+df_XGB2 = data.frame((1-ROC_XGB2$specificities), ROC_XGB2$sensitivities)
+df_best_LR = data.frame((1-ROC_best_LR$specificities), ROC_best_LR$sensitivities)
+df_best_svm = data.frame((1-ROC_best_svm$specificities), ROC_best_svm$sensitivities)
+
+
+plot(df_best_svm, col="red", type="l",     
+xlab="False Positive Rate (1-Specificity)", ylab="True Positive Rate (Sensitivity)")
+lines(df_RF2, col="blue")             
+lines(df_best_LR, col="green")               
+lines(df_XGB2, col="pink")               
+
+grid(NULL, lwd = 1)
+
+abline(a = 0, b = 1, col = "lightgray") 
+
+legend("bottomright",
+c("SVM",
+  "Random Forest", 
+  "Logistic Regression",
+"XGBoost"  ),
+fill=c("red",
+       "blue", 
+       "green",
+       "pink"
+       ))
+```
+
+
+x---------------------------------------------------Gain Chart----------------------------------------------x
+
+
+```{r message=FALSE}
+
+GainTable_RF2 <- CustomerScoringMetrics::cumGainsTable(RF2_prob, test$target, resolution = 1/100)
+GainTable_XGB2 <- CustomerScoringMetrics::cumGainsTable(pred_xgb, test$target, resolution = 1/100)
+GainTable_best_svm <- cumGainsTable(best_svm_prob, test_o_fs$target, resolution = 1/100)
+GainTable_best_LR <- cumGainsTable(best_LR_model_probs, test$target, resolution = 1/100)
+
+
+plot(GainTable_best_svm[,4], col="red", type="l",    
+xlab="Percentage of test instances", ylab="Percentage of correct predictions")
+lines(GainTable_RF2[,4], col="blue", type ="l")
+lines(GainTable_best_LR[,4], col="green", type ="l")
+lines(GainTable_XGB2[,4], col="pink", type ="l")
+
+grid(NULL, lwd = 1)
+
+legend("bottomright",
+c("SVM"
+  ,"Random Forest Tuned"
+ ,"Logistic Regression"
+ ,"XGB"
+  ),
+fill=c("red"
+      ,"blue"
+        , "green"
+      ,"pink"
+       ))
+
+
+```
